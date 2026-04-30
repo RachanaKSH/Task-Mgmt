@@ -248,9 +248,11 @@ create policy "allow all tasks" on tasks for all using (true) with check (true);
   <div class="logo"><div class="logo-pin"></div> PinBoard</div>
   <div class="nav-right">
     <div class="sync-pill"><div class="sdot" id="sdot"></div><span id="slbl">Live</span></div>
-    <button class="btn btn-danger btn-sm" onclick="confirmClearAll()">🗑 Clear All</button>
+    <div id="admin-nav-controls" style="display:flex;align-items:center;gap:10px">
+      <button class="btn btn-danger btn-sm" onclick="confirmClearAll()">🗑 Clear All</button>
+      <button class="btn btn-ghost btn-sm" onclick="resetSetup()">⚙ Settings</button>
+    </div>
     <span class="badge" id="view-badge">Manager Admin</span>
-    <button class="btn btn-ghost btn-sm" onclick="resetSetup()">⚙ Settings</button>
   </div>
 </nav>
 
@@ -322,7 +324,7 @@ create policy "allow all tasks" on tasks for all using (true) with check (true);
 <div class="toast" id="toast"><div class="tdot"></div><span id="toast-msg"></span></div>
 
 <div class="layout">
-  <aside class="sidebar">
+  <aside class="sidebar" id="app-sidebar">
     <span class="sb-label">Filter by Member</span>
     <div class="sb-item active" id="sb-all" onclick="setMemberFilter('all')">
       <div class="sb-av" style="background:var(--accent);color:#fff;font-size:9px">ALL</div>
@@ -386,8 +388,7 @@ create policy "allow all tasks" on tasks for all using (true) with check (true);
           <div><div class="user-name" id="b-name"></div><div class="user-role">Team Member · My Board</div></div>
         </div>
         <div class="bbtns">
-          <div class="rt-badge"><div class="rt-dot"></div>Real-time</div>
-          <button class="board-btn" onclick="showAdmin()">← Admin</button>
+          <div class="rt-badge"><div class="rt-dot" id="rt-dot"></div><span id="rt-label">Connecting...</span></div>
           <button class="board-btn" onclick="OM('bnote-modal')">＋ Add Note</button>
         </div>
       </div>
@@ -437,31 +438,74 @@ async function launchApp(){
   document.getElementById('app').style.display='block';
   setBusy('Loading...');
   await Promise.all([loadMembers(),loadTasks()]);
-  setReady();adminRender();subscribeRealtime();checkHash();
+  // Subscribe to realtime BEFORE routing so curBoardUser is set
+  // when the first change event arrives
+  subscribeRealtime();
+  setReady();
+  checkHash();
 }
 
 async function loadMembers(){const {data}=await sb.from('members').select('*').order('created_at');members=data||[];}
 async function loadTasks(){const {data}=await sb.from('tasks').select('*').order('created_at');tasks=(data||[]).map(t=>({...t,comments:t.comments||[]}));}
+
 
 function subscribeRealtime(){
   if(rch)sb.removeChannel(rch);
   rch=sb.channel('pinboard')
     .on('postgres_changes',{event:'*',schema:'public',table:'tasks'},p=>{
       const {eventType:et,new:n,old:o}=p;
-      if(et==='INSERT'){if(!tasks.find(t=>t.id===n.id))tasks.push({...n,comments:n.comments||[]});}
-      else if(et==='UPDATE'){const i=tasks.findIndex(t=>t.id===n.id);if(i>-1){if(tasks[i].status!==n.status){const m=members.find(m=>m.key===n.assignee);showBanner(`${m?m.name:n.assignee} → "${n.title}" is now ${statusLabel(n.status)}`);}tasks[i]={...n,comments:n.comments||[]};}}
-      else if(et==='DELETE'){tasks=tasks.filter(t=>t.id!==o.id);}
-      curBoardUser?boardRender():adminRender();
+      if(et==='INSERT'){
+        if(!tasks.find(t=>t.id===n.id)) tasks.push({...n,comments:n.comments||[]});
+      } else if(et==='UPDATE'){
+        const i=tasks.findIndex(t=>t.id===n.id);
+        if(i>-1){
+          // Show banner on admin when a member changes status
+          if(!curBoardUser && tasks[i].status!==n.status){
+            const m=members.find(m=>m.key===n.assignee);
+            showBanner(`${m?m.name:n.assignee} → "${n.title}" is now ${statusLabel(n.status)}`);
+          }
+          tasks[i]={...n,comments:n.comments||[]};
+        }
+      } else if(et==='DELETE'){
+        tasks=tasks.filter(t=>t.id!==o.id);
+      }
+      // Always re-render whichever view is currently active
+      if(curBoardUser) boardRender(); else adminRender();
     })
     .on('postgres_changes',{event:'*',schema:'public',table:'members'},p=>{
       const {eventType:et,new:n,old:o}=p;
       if(et==='INSERT'){if(!members.find(m=>m.id===n.id))members.push(n);}
       else if(et==='UPDATE'){const i=members.findIndex(m=>m.id===n.id);if(i>-1)members[i]=n;}
       else if(et==='DELETE'){members=members.filter(m=>m.id!==o.id);}
-      if(!curBoardUser)adminRender();
+      if(!curBoardUser) adminRender();
     })
-    .subscribe();
+    .subscribe(status=>{
+      const dot=document.getElementById('rt-dot');
+      const lbl=document.getElementById('rt-label');
+      if(status==='SUBSCRIBED'){
+        if(dot){dot.style.background='#34d399';}
+        if(lbl) lbl.textContent='Live';
+      } else if(status==='CHANNEL_ERROR'||status==='TIMED_OUT'){
+        if(dot){dot.style.background='#f87171';dot.style.animation='none';}
+        if(lbl) lbl.textContent='Polling…';
+        startPolling();
+      } else {
+        if(lbl) lbl.textContent='Connecting…';
+      }
+    });
 }
+
+// Fallback polling in case WebSocket/realtime is unavailable
+let pollingInterval=null;
+function startPolling(){
+  if(pollingInterval) return;
+  console.warn('Realtime unavailable, falling back to 8s polling');
+  pollingInterval=setInterval(async()=>{
+    await Promise.all([loadMembers(),loadTasks()]);
+    if(curBoardUser) boardRender(); else adminRender();
+  },8000);
+}
+
 
 function statusLabel(s){return{todo:'To Do',doing:'In Progress',done:'Done',blocked:'Blocked'}[s]||s;}
 function setBusy(msg){document.getElementById('sdot').classList.add('busy');document.getElementById('slbl').textContent=msg;}
@@ -474,8 +518,30 @@ function checkHash(){
 }
 window.addEventListener('hashchange',checkHash);
 
-function showAdmin(){curBoardUser=null;document.getElementById('admin-view').classList.add('active');document.getElementById('board-view').classList.remove('active');document.getElementById('view-badge').textContent='Manager Admin';history.replaceState(null,'','#admin');adminRender();}
-function showBoard(m){curBoardUser=m;document.getElementById('admin-view').classList.remove('active');document.getElementById('board-view').classList.add('active');document.getElementById('view-badge').textContent=m.name+"'s Board";history.replaceState(null,'','#board/'+m.key);const av=document.getElementById('b-av');av.textContent=m.initials;av.style.background=m.color;av.style.color='#fff';document.getElementById('b-name').textContent=m.name;boardRender();}
+function showAdmin(){
+  curBoardUser=null;
+  document.getElementById('admin-view').classList.add('active');
+  document.getElementById('board-view').classList.remove('active');
+  document.getElementById('view-badge').textContent='Manager Admin';
+  // Restore admin nav controls
+  document.getElementById('admin-nav-controls').style.display='flex';
+  document.getElementById('app-sidebar').style.display='flex';
+  history.replaceState(null,'','#admin');
+  adminRender();
+}
+function showBoard(m){
+  curBoardUser=m;
+  document.getElementById('admin-view').classList.remove('active');
+  document.getElementById('board-view').classList.add('active');
+  document.getElementById('view-badge').textContent=m.name+"'s Board";
+  // Hide admin-only nav controls and sidebar when on member board
+  document.getElementById('admin-nav-controls').style.display='none';
+  document.getElementById('app-sidebar').style.display='none';
+  history.replaceState(null,'','#board/'+m.key);
+  const av=document.getElementById('b-av');av.textContent=m.initials;av.style.background=m.color;av.style.color='#fff';
+  document.getElementById('b-name').textContent=m.name;
+  boardRender();
+}
 
 function adminRender(){renderSidebar();renderShareChips();renderStats();renderTable();}
 
@@ -493,7 +559,9 @@ function renderShareChips(){
   const w=document.getElementById('share-chips');
   if(!members.length){w.innerHTML='<span style="font-size:13px;color:var(--muted);font-style:italic">Add team members to generate links</span>';return;}
   const base=window.location.href.replace(/#.*/,'');
-  w.innerHTML=members.map(m=>{
+  // Show only the selected member's link when a specific member is selected
+  const toShow=filterMember==='all' ? members : members.filter(m=>m.key===filterMember);
+  w.innerHTML=toShow.map(m=>{
     const url=base+'#board/'+m.key;
     return `<div class="share-chip"><div class="chip-av" style="background:${m.color};color:#fff">${m.initials}</div><span>${m.name}</span><button class="chip-btn chip-open" onclick="showBoard(members.find(x=>x.key==='${m.key}'))">↗ Open</button><button class="chip-btn chip-copy" id="cp-${m.key}" onclick="copyLink('${m.key}','${url}')">⧉ Copy Link</button></div>`;
   }).join('');
@@ -505,13 +573,15 @@ function copyLink(key,url){
 
 function renderStats(){
   const today=new Date().toISOString().split('T')[0];
-  document.getElementById('st-total').textContent=tasks.length;
-  document.getElementById('st-doing').textContent=tasks.filter(t=>t.status==='doing').length;
-  document.getElementById('st-done').textContent=tasks.filter(t=>t.status==='done').length;
-  document.getElementById('st-over').textContent=tasks.filter(t=>t.due_date&&t.due_date<today&&t.status!=='done').length;
-  document.getElementById('sq-high').textContent=tasks.filter(t=>t.priority==='high').length;
-  document.getElementById('sq-med').textContent=tasks.filter(t=>t.priority==='med').length;
-  document.getElementById('sq-low').textContent=tasks.filter(t=>t.priority==='low').length;
+  // Scope stats to selected member; show combined only on "All Members"
+  const ts=filterMember==='all' ? tasks : tasks.filter(t=>t.assignee===filterMember);
+  document.getElementById('st-total').textContent=ts.length;
+  document.getElementById('st-doing').textContent=ts.filter(t=>t.status==='doing').length;
+  document.getElementById('st-done').textContent=ts.filter(t=>t.status==='done').length;
+  document.getElementById('st-over').textContent=ts.filter(t=>t.due_date&&t.due_date<today&&t.status!=='done').length;
+  document.getElementById('sq-high').textContent=ts.filter(t=>t.priority==='high').length;
+  document.getElementById('sq-med').textContent=ts.filter(t=>t.priority==='med').length;
+  document.getElementById('sq-low').textContent=ts.filter(t=>t.priority==='low').length;
 }
 
 function renderTable(){
